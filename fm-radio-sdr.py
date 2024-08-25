@@ -7,33 +7,38 @@ import threading
 import queue
 import time 
 
-# Configuration
+# HARDWARE CONSTANTS   
 SAMPLE_RATE = 5e6
 READ_SIZE = 131072
 CHUNK_SIZE = int(5e6)
 AUDIO_SAMPLE_RATE = 44e3
-CENTER_FREQ = 99e6
-RADIO_FREQ = 100.5e6
+CENTER_FREQ = 98.3e6
+RADIO_FREQ = 99.3e6
+
+## FILTER CONSTANTS 
 B_GLOBAL = 0
 BZ_GLOBAL = 0
 AZ_GLOBAL = 0
 A_GLOBAL = 0
 
+## FLAGS
+STOP_THREADS = False
+
 class Radio:
     def __init__(self, *args, **kwargs):
         self.sdr = SoapySDR.Device(*args, **kwargs)
         self.sdr.setSampleRate(SOAPY_SDR_RX, 0, SAMPLE_RATE)
-        self.sdr.setFrequency(SOAPY_SDR_CF32, 0, CENTER_FREQ)
+        self.sdr.setFrequency(SOAPY_SDR_RX, 0, CENTER_FREQ)
         self.rx_stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         self.sdr.activateStream(self.rx_stream)
         self.sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'LNA', 16)  
         self.sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'VGA', 20)  
         self.sdr.setGain(SoapySDR.SOAPY_SDR_RX, 0, 'AMP', 1)   
 
-    ## THREAD: Contiously capture samples and puts them in a buffer
+    ## THREAD: Contiously capture samples and puts them in the 'samples buffer'
     def capture_samples(self, buffer):
         ## Method that captures samples and puts them in shared buffer
-        while True:
+        while not STOP_THREADS:
             samples = np.empty(READ_SIZE, np.complex64)
             self.sdr.readStream(self.rx_stream, [samples], len(samples))
             buffer.put(samples)
@@ -43,11 +48,11 @@ class Radio:
         self.sdr.deactivateStream(self.rx_stream)
         self.sdr.closeStream(self.rx_stream)
 
-## THREAD: Plays Audio
+## THREAD: Plays Audio (takes out of 'audio buffer' and gives it to sound card)
 def play_audio(audio_buffer):
     time.sleep(5) ## Sleep this thread fo a while to let the buffer fillup initially 
     with sd.OutputStream(samplerate=AUDIO_SAMPLE_RATE, channels=1, dtype='int16') as stream:
-        while True:
+        while not STOP_THREADS:
             audio_signal = audio_buffer.get()
             stream.write(audio_signal)
 
@@ -64,6 +69,9 @@ def fm_demodulate(iq_samples, sample_rate, audio_sample_rate, offset_freq):
 
     # Actual FM demodulation
     angle = 0.5 * np.angle(iq_shifted[1:] * np.conj(iq_shifted[:-1]))
+
+    ## FM De-emphasis filter, H(s) = 1/(RC*s + 1), implemented as IIR via bilinear transform
+    ## Credits: https://pysdr.org/content/rds.html
     angle = lfilter(BZ_GLOBAL, AZ_GLOBAL, angle)
 
     # Decimate to reduce the sample rate to the sample rate an audio card can take
@@ -75,9 +83,10 @@ def fm_demodulate(iq_samples, sample_rate, audio_sample_rate, offset_freq):
     return audio_signal
 
 
-## THREAD: 
+## THREAD: Takes samples out of 'sample buffer' in particular chunks, demodulates the chunk
+## and puts chunk in audio buffer
 def processing_thread(sample_buffer, audio_buffer):
-    while True:
+    while not STOP_THREADS:
         samples = np.concatenate([sample_buffer.get() for _ in range(int(CHUNK_SIZE / READ_SIZE))])
         audio_signal = fm_demodulate(samples, SAMPLE_RATE, AUDIO_SAMPLE_RATE, CENTER_FREQ - RADIO_FREQ)
         audio_buffer.put(audio_signal)
@@ -89,15 +98,19 @@ def main():
     # Create Radio object
     myRad = Radio(dict(driver="hackrf"))
 
+    ## Butterworth LP filter parameters to get only FM radio bandwith
     highcut = 125e3 / (SAMPLE_RATE / 2)
     b, a = butter(N=4, Wn=highcut, btype='low')
+    global B_GLOBAL, A_GLOBAL
+    B_GLOBAL = b
+    A_GLOBAL = a
+
+    ## Bilinear trandor FM de-empahsis filter paramerters 
     bz, az = bilinear(1, [75e-6, 1], fs=SAMPLE_RATE)
     global BZ_GLOBAL, AZ_GLOBAL
     BZ_GLOBAL = bz
     AZ_GLOBAL = az
-    global B_GLOBAL, A_GLOBAL
-    B_GLOBAL = b
-    A_GLOBAL = a
+    
     # Start threads
     capture_thread = threading.Thread(target=myRad.capture_samples, args=(sample_buffer,))
     process_thread = threading.Thread(target=processing_thread, args=(sample_buffer, audio_buffer))
@@ -112,7 +125,8 @@ def main():
         capture_thread.join()
         process_thread.join()
         playback_thread.join()
-    finally:
+    except KeyboardInterrupt:
+        time.sleep(1)
         myRad.stop()
 
 if __name__ == "__main__":
